@@ -1,0 +1,698 @@
+---
+title: "Customer Acquisition & Retention Analysis"
+author: "Elizabeth Obst, Shamir Cardenas, Jordan Bona, Olivia Shipley"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: show
+    theme: default
+---
+
+
+```{r}
+library(SMCRM)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(pdp)
+library(pROC)
+library(corrplot)
+
+# Set seed so results are reproducible
+set.seed(123)
+```
+
+```{r}
+data(acquisitionRetention)
+
+cat("Dataset dimensions:", nrow(acquisitionRetention), "rows,", 
+    ncol(acquisitionRetention), "columns\n\n")
+
+str(acquisitionRetention)
+```
+
+# EDA
+
+## Basic Statistics
+
+```{r}
+# Summary statistics
+summary(acquisitionRetention)
+
+# Check for missing values
+cat("\nMissing values per column:\n")
+missing_counts <- colSums(is.na(acquisitionRetention))
+print(missing_counts[missing_counts > 0])
+
+if(sum(missing_counts) == 0) {
+  cat("No missing values found!\n")
+}
+```
+
+## Target Variable Analysis
+
+```{r}
+par(mfrow = c(1, 2))
+
+# Acquisition counts
+acq_table <- table(acquisitionRetention$acquisition)
+barplot(acq_table, 
+        main = "Customer Acquisition Distribution",
+        xlab = "Acquired (0=No, 1=Yes)", 
+        ylab = "Count",
+        col = c("coral", "lightgreen"),
+        ylim = c(0, max(acq_table) * 1.2))
+text(x = c(0.7, 1.9), y = acq_table, labels = acq_table, pos = 3)
+
+# Acquisition percentages
+acq_prop <- prop.table(acq_table) * 100
+barplot(acq_prop,
+        main = "Acquisition Rate (%)",
+        xlab = "Acquired (0=No, 1=Yes)",
+        ylab = "Percentage",
+        col = c("coral", "lightgreen"),
+        ylim = c(0, max(acq_prop) * 1.2))
+text(x = c(0.7, 1.9), y = acq_prop, 
+     labels = paste0(round(acq_prop, 1), "%"), pos = 3)
+
+par(mfrow = c(1, 1))
+
+cat("\nAcquisition Summary:\n")
+cat("Not Acquired:", acq_table[1], "(", round(acq_prop[1], 1), "%)\n")
+cat("Acquired:", acq_table[2], "(", round(acq_prop[2], 1), "%)\n")
+```
+
+## Duration Analysis
+
+```{r}
+# Analyze duration for acquired customers
+acquired <- acquisitionRetention[acquisitionRetention$acquisition == 1, ]
+not_acquired <- acquisitionRetention[acquisitionRetention$acquisition == 0, ]
+
+par(mfrow = c(2, 2))
+
+# Duration for acquired customers
+hist(acquired$duration, 
+     main = "Duration Distribution (Acquired Customers)",
+     xlab = "Duration", 
+     col = "skyblue",
+     breaks = 30,
+     border = "white")
+
+# Duration with density curve
+hist(acquired$duration, 
+     probability = TRUE,
+     main = "Duration with Density Curve",
+     xlab = "Duration",
+     col = "lightblue",
+     breaks = 30,
+     border = "white")
+lines(density(acquired$duration), col = "red", lwd = 2)
+
+# Boxplot
+boxplot(acquired$duration,
+        main = "Duration Boxplot",
+        ylab = "Duration",
+        col = "lightgreen",
+        horizontal = FALSE)
+
+# QQ plot to check normality
+qqnorm(acquired$duration, main = "Q-Q Plot of Duration")
+qqline(acquired$duration, col = "red", lwd = 2)
+
+par(mfrow = c(1, 1))
+
+cat("\nDuration Summary Statistics (Acquired Customers):\n")
+print(summary(acquired$duration))
+cat("\nStandard Deviation:", sd(acquired$duration), "\n")
+```
+
+## Feature Distributions
+
+```{r}
+# Get all numeric predictors
+numeric_cols <- names(acquisitionRetention)[sapply(acquisitionRetention, is.numeric)]
+numeric_cols <- setdiff(numeric_cols, c("acquisition", "duration"))
+
+if(length(numeric_cols) > 0) {
+  n_plots <- min(12, length(numeric_cols))
+  par(mfrow = c(3, 4))
+  
+  for(i in 1:n_plots) {
+    col_name <- numeric_cols[i]
+    hist(acquisitionRetention[[col_name]], 
+         main = col_name,
+         xlab = col_name,
+         col = "steelblue",
+         breaks = 20,
+         border = "white")
+  }
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+## Features by Acquisition Status
+
+```{r}
+# Compare feature distributions between acquired and not acquired
+if(length(numeric_cols) > 0) {
+  n_plots <- min(9, length(numeric_cols))
+  par(mfrow = c(3, 3))
+  
+  for(i in 1:n_plots) {
+    col_name <- numeric_cols[i]
+    boxplot(acquisitionRetention[[col_name]] ~ acquisitionRetention$acquisition,
+            main = col_name,
+            xlab = "Acquired (0=No, 1=Yes)",
+            ylab = col_name,
+            col = c("coral", "lightgreen"),
+            outline = TRUE)
+  }
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+## Correlation Analysis
+
+```{r}
+# Create correlation matrix
+numeric_data <- acquisitionRetention[, c("acquisition", numeric_cols[1:min(15, length(numeric_cols))])]
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+# Plot correlation heatmap
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "upper", 
+         tl.col = "black", 
+         tl.srt = 45,
+         addCoef.col = "black",
+         number.cex = 0.7,
+         title = "Feature Correlation Matrix",
+         mar = c(0, 0, 2, 0))
+
+# Find highly correlated features with acquisition
+cat("\nCorrelation with Acquisition:\n")
+acq_cor <- sort(abs(cor_matrix[, "acquisition"]), decreasing = TRUE)
+print(head(acq_cor, 10))
+```
+
+# Data Preparation
+
+
+```{r}
+# Check the data structure
+cat("All columns:\n")
+print(names(acquisitionRetention))
+
+# Variables to remove (consequences of acquisition, not predictors):
+leakage_vars <- c("duration", "profit", "ret_exp", "acq_exp_sq", "ret_exp_sq", 
+                  "freq", "freq_sq", "crossbuy", "sow")
+
+cat("Removing these variables to prevent leakage:\n")
+print(leakage_vars)
+
+# Check for ID columns
+id_cols <- grep("id|ID|customer", names(acquisitionRetention), 
+                ignore.case = TRUE, value = TRUE)
+if(length(id_cols) > 0) {
+  cat("\nAlso removing ID columns:", paste(id_cols, collapse = ", "), "\n")
+  leakage_vars <- c(leakage_vars, id_cols)
+}
+
+# Create modeling dataset with only legitimate predictors
+data_for_models <- acquisitionRetention[, !names(acquisitionRetention) %in% leakage_vars]
+
+cat("\nVariables Used for Modeling:\n")
+cat("Features:", paste(setdiff(names(data_for_models), "acquisition"), collapse = ", "), "\n")
+cat("Number of features:", ncol(data_for_models) - 1, "\n")
+
+# Split data 70/30
+set.seed(123)
+n <- nrow(data_for_models)
+train_size <- floor(0.7 * n)
+train_indices <- sample(1:n, train_size)
+
+train <- data_for_models[train_indices, ]
+test <- data_for_models[-train_indices, ]
+
+cat("\nTraining set:", nrow(train), "observations\n")
+cat("Test set:", nrow(test), "observations\n")
+cat("Acquisition rate in training:", round(mean(train$acquisition), 3), "\n")
+cat("Acquisition rate in test:", round(mean(test$acquisition), 3), "\n")
+```
+
+# Modeling
+
+## Random Forest Model
+
+```{r}
+# Prepare data (remove duration column)
+train_no_duration <- train
+test_no_duration <- test
+
+# Build Random Forest
+rf_model <- randomForest(
+  as.factor(acquisition) ~ .,
+  data = train_no_duration,
+  ntree = 300,
+  importance = TRUE
+)
+
+print(rf_model)
+```
+
+### Variable Importance
+
+```{r}
+# Plot variable importance
+varImpPlot(rf_model, 
+           main = "Random Forest Variable Importance",
+           n.var = min(20, nrow(importance(rf_model))))
+
+# Get importance scores
+importance_scores <- importance(rf_model)
+importance_df <- data.frame(
+  Variable = rownames(importance_scores),
+  Importance = importance_scores[, "MeanDecreaseGini"]
+)
+importance_df <- importance_df[order(-importance_df$Importance), ]
+
+cat("\nTop 10 Most Important Variables:\n")
+print(head(importance_df, 10))
+```
+
+### Hyperparameter Tuning
+
+```{r}
+# Try different mtry values
+cat("Tuning mtry parameter\n\n")
+results <- data.frame(mtry = numeric(), OOB_error = numeric())
+
+for(m in c(2, 4, 6, 8, 10)) {
+  rf_temp <- randomForest(
+    as.factor(acquisition) ~ .,
+    data = train_no_duration,
+    ntree = 300,
+    mtry = m
+  )
+  
+  oob_error <- rf_temp$err.rate[300, 1]
+  results <- rbind(results, data.frame(mtry = m, OOB_error = oob_error))
+  cat("mtry =", m, "| OOB Error =", round(oob_error, 4), "\n")
+}
+
+# Plot tuning results
+plot(results$mtry, results$OOB_error, 
+     type = "b", 
+     xlab = "mtry", 
+     ylab = "OOB Error",
+     main = "Random Forest Tuning",
+     col = "blue",
+     pch = 16,
+     lwd = 2)
+
+best_mtry <- results$mtry[which.min(results$OOB_error)]
+cat("\nBest mtry:", best_mtry, "\n")
+```
+
+### Final Random Forest Model
+
+```{r}
+# Build final model with best parameters
+rf_final <- randomForest(
+  as.factor(acquisition) ~ .,
+  data = train_no_duration,
+  ntree = 300,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+cat("Final Random Forest Model:\n")
+print(rf_final)
+
+# Make predictions
+rf_pred_class <- predict(rf_final, test_no_duration)
+rf_pred_prob <- predict(rf_final, test_no_duration, type = "prob")[, 2]
+rf_pred_numeric <- as.numeric(as.character(rf_pred_class))
+```
+
+## Decision Tree Model
+
+```{r}
+# Build decision tree
+tree_model <- rpart(
+  acquisition ~ .,
+  data = train_no_duration,
+  method = "class"
+)
+
+# Plot complexity parameter
+plotcp(tree_model)
+
+# Prune tree
+best_cp <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+cat("Best CP:", best_cp, "\n")
+
+tree_pruned <- prune(tree_model, cp = best_cp)
+
+# Visualize tree
+rpart.plot(tree_pruned, 
+           main = "Pruned Decision Tree",
+           extra = 104,
+           fallen.leaves = TRUE)
+
+# Make predictions
+tree_pred_prob <- predict(tree_pruned, test_no_duration)[, 2]
+tree_pred_class <- ifelse(tree_pred_prob > 0.5, 1, 0)
+```
+
+## Logistic Regression Model
+
+```{r}
+# Build logistic regression
+logit_model <- glm(
+  acquisition ~ .,
+  data = train_no_duration,
+  family = binomial
+)
+
+summary(logit_model)
+
+# Make predictions
+logit_pred_prob <- predict(logit_model, test_no_duration, type = "response")
+logit_pred_class <- ifelse(logit_pred_prob > 0.5, 1, 0)
+```
+
+### Significant Variables
+
+```{r}
+# Extract coefficients
+coef_summary <- summary(logit_model)$coefficients
+significant_vars <- coef_summary[coef_summary[, 4] < 0.05, ]
+
+cat("Significant Variables (p < 0.05):\n")
+print(significant_vars)
+
+# Plot coefficients
+if(nrow(significant_vars) > 1) {
+  sig_coefs <- significant_vars[-1, 1]  # Remove intercept
+  
+  # Sort by absolute value
+  sig_coefs_sorted <- sort(sig_coefs)
+  
+  par(mar = c(5, 8, 4, 2))
+  barplot(sig_coefs_sorted, 
+          horiz = TRUE,
+          las = 1,
+          col = ifelse(sig_coefs_sorted > 0, "steelblue", "coral"),
+          main = "Significant Logistic Regression Coefficients",
+          xlab = "Coefficient Value")
+  abline(v = 0, lty = 2)
+  par(mar = c(5, 4, 4, 2))
+}
+```
+
+# Model Comparison
+
+
+```{r}
+# Calculate accuracy
+calc_accuracy <- function(actual, predicted) {
+  sum(actual == predicted) / length(actual)
+}
+
+# Sanity check for data leakage
+cat("Diagnostic Check:\n")
+cat("Test set size:", nrow(test), "\n")
+cat("Actual acquisition distribution:", table(test$acquisition), "\n")
+cat("RF predictions distribution:", table(rf_pred_numeric), "\n\n")
+
+# Calculate metrics
+rf_accuracy <- calc_accuracy(test$acquisition, rf_pred_numeric)
+tree_accuracy <- calc_accuracy(test$acquisition, tree_pred_class)
+logit_accuracy <- calc_accuracy(test$acquisition, logit_pred_class)
+
+cat("Accuracy Results:\n")
+cat("Random Forest:", round(rf_accuracy, 4), "\n")
+cat("Decision Tree:", round(tree_accuracy, 4), "\n")
+cat("Logistic Regression:", round(logit_accuracy, 4), "\n\n")
+
+if(max(rf_accuracy, tree_accuracy, logit_accuracy) > 0.95) {
+  cat("Note: Very high accuracy detected. This could indicate:\n")
+  cat("- Strong predictive patterns in the data\n")
+  cat("- Potential overfitting (validate on new data)\n\n")
+}
+```
+
+## Confusion Matrices
+
+```{r}
+par(mfrow = c(1, 3))
+
+# Function to create nice confusion matrix
+plot_confusion <- function(actual, predicted, title) {
+  cm <- table(Predicted = predicted, Actual = actual)
+  
+  # Calculate percentages
+  cm_pct <- prop.table(cm, 2) * 100
+  
+  # Create color matrix
+  colors <- matrix(c("lightcoral", "lightgreen", "lightgreen", "lightcoral"), 
+                   nrow = 2)
+  
+  # Plot
+  plot(0, 0, type = "n", xlim = c(0, 2), ylim = c(0, 2),
+       xlab = "Actual", ylab = "Predicted", main = title,
+       xaxt = "n", yaxt = "n")
+  
+  # Add colored rectangles
+  rect(0, 0, 1, 1, col = colors[1, 1], border = "black")
+  rect(1, 0, 2, 1, col = colors[1, 2], border = "black")
+  rect(0, 1, 1, 2, col = colors[2, 1], border = "black")
+  rect(1, 1, 2, 2, col = colors[2, 2], border = "black")
+  
+  # Add text
+  text(0.5, 1.5, paste0(cm[2, 1], "\n(", round(cm_pct[2, 1], 1), "%)"), cex = 1.2)
+  text(1.5, 1.5, paste0(cm[2, 2], "\n(", round(cm_pct[2, 2], 1), "%)"), cex = 1.2)
+  text(0.5, 0.5, paste0(cm[1, 1], "\n(", round(cm_pct[1, 1], 1), "%)"), cex = 1.2)
+  text(1.5, 0.5, paste0(cm[1, 2], "\n(", round(cm_pct[1, 2], 1), "%)"), cex = 1.2)
+  
+  # Add axis labels
+  axis(1, at = c(0.5, 1.5), labels = c("0", "1"))
+  axis(2, at = c(0.5, 1.5), labels = c("0", "1"))
+}
+
+plot_confusion(test$acquisition, rf_pred_numeric, "Random Forest")
+plot_confusion(test$acquisition, tree_pred_class, "Decision Tree")
+plot_confusion(test$acquisition, logit_pred_class, "Logistic Regression")
+
+par(mfrow = c(1, 1))
+```
+
+## ROC Curves
+
+```{r}
+# Calculate ROC curves
+rf_roc <- roc(test$acquisition, rf_pred_prob, quiet = TRUE)
+tree_roc <- roc(test$acquisition, tree_pred_prob, quiet = TRUE)
+logit_roc <- roc(test$acquisition, logit_pred_prob, quiet = TRUE)
+
+# Plot
+plot(rf_roc, col = "blue", lwd = 2, main = "ROC Curves Comparison")
+plot(tree_roc, col = "red", lwd = 2, add = TRUE)
+plot(logit_roc, col = "green", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright", 
+       legend = c(
+         paste("Random Forest (AUC =", round(auc(rf_roc), 3), ")"),
+         paste("Decision Tree (AUC =", round(auc(tree_roc), 3), ")"),
+         paste("Logistic Regression (AUC =", round(auc(logit_roc), 3), ")")
+       ),
+       col = c("blue", "red", "green"),
+       lwd = 2,
+       cex = 0.9)
+```
+
+## Performance Summary Table
+
+```{r}
+# Create summary table
+summary_df <- data.frame(
+  Model = c("Random Forest", "Decision Tree", "Logistic Regression"),
+  Accuracy = c(rf_accuracy, tree_accuracy, logit_accuracy),
+  AUC = c(auc(rf_roc), auc(tree_roc), auc(logit_roc))
+)
+
+print(summary_df)
+
+best_model <- summary_df$Model[which.max(summary_df$AUC)]
+cat("\nBest Model:", best_model, "\n")
+```
+
+# Duration Prediction
+
+
+```{r}
+# For duration prediction, we use the full dataset (including retention variables)
+# because duration is only predicted after acquisition
+
+# Get acquired customers from original data
+train_acquired_full <- acquisitionRetention[train_indices, ]
+train_acquired_full <- train_acquired_full[train_acquired_full$acquisition == 1, ]
+
+test_acquired_full <- acquisitionRetention[-train_indices, ]
+test_acquired_full <- test_acquired_full[test_acquired_full$acquisition == 1, ]
+
+cat("Acquired customers in training:", nrow(train_acquired_full), "\n")
+cat("Acquired customers in test:", nrow(test_acquired_full), "\n\n")
+
+if(nrow(train_acquired_full) > 10) {
+  # Remove acquisition column and any ID columns for duration model
+  duration_predictors <- setdiff(names(train_acquired_full), 
+                                c("acquisition", "duration", id_cols))
+  
+  cat("Using these predictors for duration:\n")
+  print(duration_predictors)
+  cat("\n")
+  
+  # Build duration model with all available features
+  rf_duration <- randomForest(
+    duration ~ .,
+    data = train_acquired_full[, c("duration", duration_predictors)],
+    ntree = 300,
+    importance = TRUE
+  )
+  
+  print(rf_duration)
+  
+  # Variable importance for duration
+  varImpPlot(rf_duration, 
+             main = "Important Variables for Duration Prediction",
+             n.var = min(15, nrow(importance(rf_duration))))
+  
+  # Predictions
+  if(nrow(test_acquired_full) > 0) {
+    duration_pred <- predict(rf_duration, test_acquired_full)
+    
+    # Performance metrics
+    rmse <- sqrt(mean((test_acquired_full$duration - duration_pred)^2))
+    mae <- mean(abs(test_acquired_full$duration - duration_pred))
+    r_squared <- cor(test_acquired_full$duration, duration_pred)^2
+    
+    cat("\nDuration Model Performance:\n")
+    cat("RMSE:", round(rmse, 3), "\n")
+    cat("MAE:", round(mae, 3), "\n")
+    cat("R-squared:", round(r_squared, 3), "\n")
+    
+    # Plot actual vs predicted
+    par(mfrow = c(1, 2))
+    
+    plot(test_acquired_full$duration, duration_pred,
+         xlab = "Actual Duration", 
+         ylab = "Predicted Duration",
+         main = "Actual vs Predicted Duration",
+         pch = 16,
+         col = rgb(0, 0, 1, 0.5))
+    abline(0, 1, col = "red", lwd = 2)
+    
+    # Residuals plot
+    residuals <- test_acquired_full$duration - duration_pred
+    plot(duration_pred, residuals,
+         xlab = "Predicted Duration",
+         ylab = "Residuals",
+         main = "Residual Plot",
+         pch = 16,
+         col = rgb(1, 0, 0, 0.5))
+    abline(h = 0, col = "blue", lwd = 2, lty = 2)
+    
+    par(mfrow = c(1, 1))
+  }
+}
+
+# Get importance scores
+importance_scores <- importance(rf_duration)
+print(importance_scores)
+
+# Sort by %IncMSE
+importance_scores[order(importance_scores[,1], decreasing = TRUE), ]
+```
+
+# Partial Dependence Plots
+
+```{r}
+# Get top important variables
+imp <- importance(rf_final)
+top_vars <- head(rownames(imp)[order(-imp[, 1])], 6)
+
+# Store PDP data for interpretation
+pdp_summary <- list()
+
+par(mfrow = c(2, 3))
+for(var in top_vars) {
+  pdp_data <- partial(rf_final, 
+                      pred.var = var,
+                      prob = TRUE,
+                      which.class = "1")
+  
+  # Store summary statistics
+  pdp_summary[[var]] <- data.frame(
+    variable = var,
+    min_value = min(pdp_data[[1]]),
+    max_value = max(pdp_data[[1]]),
+    min_prob = min(pdp_data$yhat),
+    max_prob = max(pdp_data$yhat),
+    range_effect = max(pdp_data$yhat) - min(pdp_data$yhat),
+    mean_prob = mean(pdp_data$yhat)
+  )
+  
+  # Plot
+  plot(pdp_data[[1]], pdp_data$yhat,
+       type = "l",
+       lwd = 2,
+       col = "blue",
+       main = paste("Effect of", var),
+       xlab = var,
+       ylab = "Probability of Acquisition")
+  grid()
+}
+par(mfrow = c(1, 1))
+
+# Print summary for interpretation
+pdp_df <- do.call(rbind, pdp_summary)
+print(pdp_df)
+
+```
+
+# Key Findings
+
+## Model Performance
+
+```{r}
+cat("Final Model Comparison:\n\n")
+print(summary_df)
+
+cat("\nBest performing model:", best_model, "\n")
+cat("Best AUC:", round(max(summary_df$AUC), 4), "\n")
+cat("Best Accuracy:", round(max(summary_df$Accuracy), 4), "\n")
+```
+
+## Important Insights
+
+1. The best model was Logistic Regression - Best AUC: 0.8491 Best Accuracy: 0.8 
+
+2. The top most important variables for predicting acquisition are: employees, acq_exp, revenue, and industry
+
+```{r}
+print(head(importance_df, 5))
+```
+
+3. Duration model performance: Random Forest
+RMSE: 32.878 
+MAE: 24.195 
+R-squared: 0.978 
+
+
